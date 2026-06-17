@@ -164,35 +164,60 @@ def show():
     st.markdown("### 📄 Executive Summary")
 
     if st.button("Generate Executive Summary", type="primary"):
-        if "themes" not in st.session_state:
-            st.warning("Run AI Theme Analysis first.")
+    if "themes" not in st.session_state:
+        st.warning("Run AI Theme Analysis first.")
+    else:
+        try:
+            client = get_groq_client()
+        except ValueError as e:
+            st.error(str(e))
+            return
+
+        # Safe date handling
+        if (
+            "date" in filtered.columns
+            and not filtered.empty
+            and filtered["date"].notna().any()
+        ):
+            d_min = filtered["date"].min().strftime("%b %d, %Y")
+            d_max = filtered["date"].max().strftime("%b %d, %Y")
         else:
-            try:
-                client = get_groq_client()
-            except ValueError as e:
-                st.error(str(e)); return
-            d_min = filtered["date"].min().strftime("%b %d, %Y") if "date" in filtered.columns else "N/A"
-            d_max = filtered["date"].max().strftime("%b %d, %Y") if "date" in filtered.columns else "N/A"
-            with st.spinner("Writing summary..."):
-                summary = write_exec_summary(
-                    themes=st.session_state["themes"],
-                    anomaly_stores=pd.DataFrame(),
-                    total_reviews=len(filtered),
-                    avg_rating=filtered["stars"].mean(),
-                    date_range=f"{d_min} – {d_max}",
-                    client=client,
-                    brand_name=APP_NAME,
-                )
-            st.markdown(f"""
+            d_min = "N/A"
+            d_max = "N/A"
+
+        avg_rating = (
+            round(filtered["stars"].mean(), 2)
+            if not filtered.empty
+            else 0
+        )
+
+        with st.spinner("Writing summary..."):
+            summary = write_exec_summary(
+                themes=st.session_state["themes"],
+                anomaly_stores=pd.DataFrame(),
+                total_reviews=len(filtered),
+                avg_rating=avg_rating,
+                date_range=f"{d_min} – {d_max}",
+                client=client,
+                brand_name=APP_NAME,
+            )
+
+        st.markdown(
+            f"""
             <div style="background:#F1EFE8;border-radius:12px;padding:20px 24px;border:1px solid #D3D1C7;">
                 <div style="font-size:11px;font-weight:600;letter-spacing:0.08em;color:#888;text-transform:uppercase;margin-bottom:12px;">
                     Executive Summary · AI Generated
                 </div>
                 <div style="font-size:15px;line-height:1.8;color:#2C2C2A;">
-                    {summary.replace(chr(10),'<br><br>')}
+                    {summary.replace(chr(10), '<br><br>')}
                 </div>
-            </div>""", unsafe_allow_html=True)
-            st.code(summary, language=None)
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.code(summary, language=None)
+        filtered = df[mask].copy()
 
     # ── Raw reviews ───────────────────────────────────────────────────────────
     st.markdown("---")
