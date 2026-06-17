@@ -2,10 +2,9 @@
 Smart Data Extractor - automatically chooses the right data source:
 
   1. APP_STORE_ID set in config.py → scrapes Apple App Store (iTunes RSS)
-  2. APP_STORE_ID empty           → scrapes Amazon + Reddit automatically
+  2. APP_STORE_ID empty           → scrapes Google Reviews via SerpAPI
 
-No API keys needed for any source.
-Runs automatically via GitHub Actions on every push to config.py.
+No scraping blocks. Works perfectly from GitHub Actions.
 
 Usage (local):
     python module1_voice_of_customer/01_extract_reviews.py
@@ -19,14 +18,14 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
-import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     BRAND_NAME, KEYWORDS, APP_STORE_ID, APP_COUNTRY,
-    AMAZON_ASINS, REDDIT_SUBREDDITS, MAX_REVIEW_PAGES,
-    MAX_AMAZON_ASINS, MAX_REDDIT_POSTS, DATA_DIR, REVIEWS_CSV,
+    MAX_REVIEW_PAGES, DATA_DIR, REVIEWS_CSV,
 )
+
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
 HEADERS = {
     "User-Agent": (
@@ -37,13 +36,12 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-FIELDNAMES = ["review_id","stars","date","title","text","source","product","version","vote_count"]
+FIELDNAMES = ["review_id", "stars", "date", "title", "text",
+              "source", "product", "version", "vote_count"]
 
 
-def fetch_url(url, extra_headers=None, timeout=20):
-    """Fetch a URL and return the response body as string."""
-    h = {**HEADERS, **(extra_headers or {})}
-    req = urllib.request.Request(url, headers=h)
+def fetch_url(url, timeout=20):
+    req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8")
 
@@ -63,21 +61,21 @@ def scrape_app_store():
             data    = json.loads(fetch_url(url))
             entries = data.get("feed", {}).get("entry", [])
             if page == 1 and entries:
-                entries = entries[1:]  # skip app metadata entry
+                entries = entries[1:]
             if not entries:
                 print(f"   Page {page}: no more reviews.")
                 break
             for e in entries:
                 reviews.append({
-                    "review_id":  e.get("id",{}).get("label",""),
-                    "stars":      e.get("im:rating",{}).get("label",""),
-                    "date":       e.get("updated",{}).get("label","")[:10],
-                    "title":      e.get("title",{}).get("label",""),
-                    "text":       e.get("content",{}).get("label","").replace("\n"," ").strip(),
+                    "review_id":  e.get("id", {}).get("label", ""),
+                    "stars":      e.get("im:rating", {}).get("label", ""),
+                    "date":       e.get("updated", {}).get("label", "")[:10],
+                    "title":      e.get("title", {}).get("label", ""),
+                    "text":       e.get("content", {}).get("label", "").replace("\n", " ").strip(),
                     "source":     "app_store",
                     "product":    BRAND_NAME,
-                    "version":    e.get("im:version",{}).get("label",""),
-                    "vote_count": e.get("im:voteCount",{}).get("label","0"),
+                    "version":    e.get("im:version", {}).get("label", ""),
+                    "vote_count": e.get("im:voteCount", {}).get("label", "0"),
                 })
             print(f"   Page {page}: {len(entries)} reviews (total: {len(reviews)})")
             time.sleep(0.5)
@@ -93,152 +91,179 @@ def scrape_app_store():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SOURCE 2 - Amazon Product Reviews
+# SOURCE 2 - Google Reviews via SerpAPI
 # ══════════════════════════════════════════════════════════════════════════════
 
-def search_amazon_asins():
-    """Search Amazon for top products matching KEYWORDS and return ASINs."""
-    asins = []
-    query = urllib.parse.quote_plus(KEYWORDS[0] if KEYWORDS else BRAND_NAME)
-    url   = f"https://www.amazon.com/s?k={query}&i=beauty"
-
+def search_google_place(keyword):
+    """Search for a business on Google and return its place data_id."""
+    params = urllib.parse.urlencode({
+        "engine":  "google_maps",
+        "q":       keyword,
+        "api_key": SERPAPI_KEY,
+        "type":    "search",
+    })
+    url = f"https://serpapi.com/search?{params}"
     try:
-        html  = fetch_url(url, extra_headers={"Accept": "text/html"})
-        found = re.findall(r'data-asin="([A-Z0-9]{10})"', html)
-        # Deduplicate preserving order
-        seen = set()
-        for a in found:
-            if a not in seen:
-                asins.append(a)
-                seen.add(a)
-        asins = asins[:MAX_AMAZON_ASINS]
-        print(f"   Found ASINs on Amazon: {asins}")
+        data    = json.loads(fetch_url(url))
+        results = data.get("local_results", [])
+        if results:
+            place = results[0]
+            print(f"   Found: {place.get('title','?')} - rating: {place.get('rating','?')} ({place.get('reviews','?')} reviews)")
+            return place.get("data_id", ""), place.get("title", keyword), place.get("rating", "")
     except Exception as ex:
-        print(f"   Amazon search failed: {ex}")
+        print(f"   Google Maps search failed: {ex}")
+    return "", keyword, ""
 
-    return asins
 
-
-def scrape_amazon_product(asin):
-    """Scrape reviews for one Amazon ASIN via the public reviews page."""
+def scrape_google_reviews(data_id, place_name, max_pages=5):
+    """Scrape Google reviews for a place using its data_id."""
     reviews  = []
-    base_url = f"https://www.amazon.com/product-reviews/{asin}?sortBy=recent&pageNumber="
+    next_token = None
 
-    for page in range(1, 6):  # max 5 pages × ~10 reviews = 50 per product
+    for page in range(max_pages):
+        params = {
+            "engine":      "google_maps_reviews",
+            "data_id":     data_id,
+            "api_key":     SERPAPI_KEY,
+            "sort_by":     "newestFirst",
+            "hl":          "en",
+        }
+        if next_token:
+            params["next_page_token"] = next_token
+
+        url = f"https://serpapi.com/search?{urllib.parse.urlencode(params)}"
         try:
-            html  = fetch_url(base_url + str(page), extra_headers={"Accept": "text/html"})
+            data         = json.loads(fetch_url(url))
+            raw_reviews  = data.get("reviews", [])
 
-            # Extract review blocks
-            blocks = re.findall(
-                r'data-hook="review".*?(?=data-hook="review"|$)',
-                html, re.DOTALL
-            )
-
-            # Fallback: extract individual fields directly
-            titles  = re.findall(r'data-hook="review-title"[^>]*>.*?<span[^>]*>(.*?)</span>', html, re.DOTALL)
-            ratings = re.findall(r'data-hook="review-star-rating"[^>]*>.*?(\d+\.\d+) out of', html, re.DOTALL)
-            texts   = re.findall(r'data-hook="review-body"[^>]*>.*?<span[^>]*>(.*?)</span>', html, re.DOTALL)
-            dates   = re.findall(r'data-hook="review-date"[^>]*>(.*?)</span>', html, re.DOTALL)
-            ids     = re.findall(r'id="([A-Z0-9]{13,})"', html)
-
-            count = min(len(titles), len(ratings), len(texts))
-            if count == 0:
+            if not raw_reviews:
+                print(f"   Page {page+1}: no more reviews.")
                 break
 
-            for i in range(count):
-                clean_text = re.sub(r'<[^>]+>', '', texts[i]).strip()
-                clean_title = re.sub(r'<[^>]+>', '', titles[i]).strip()
-                if not clean_text:
-                    continue
+            for r in raw_reviews:
                 reviews.append({
-                    "review_id":  ids[i] if i < len(ids) else f"{asin}_{page}_{i}",
-                    "stars":      ratings[i] if i < len(ratings) else "",
-                    "date":       dates[i].replace("Reviewed in the United States on ","")[:20].strip() if i < len(dates) else "",
-                    "title":      clean_title[:200],
-                    "text":       clean_text[:1000],
-                    "source":     "amazon",
-                    "product":    f"{BRAND_NAME} (ASIN: {asin})",
+                    "review_id":  r.get("review_id", f"{data_id}_{page}_{len(reviews)}"),
+                    "stars":      str(r.get("rating", "")),
+                    "date":       r.get("date", ""),
+                    "title":      "",
+                    "text":       r.get("snippet", "").replace("\n", " ").strip(),
+                    "source":     "google_reviews",
+                    "product":    place_name,
                     "version":    "",
-                    "vote_count": "0",
+                    "vote_count": str(r.get("likes", 0)),
                 })
 
-            print(f"   ASIN {asin} page {page}: {count} reviews")
-            time.sleep(1.5)  # respectful delay
+            print(f"   Page {page+1}: {len(raw_reviews)} reviews (total: {len(reviews)})")
+            next_token = data.get("serpapi_pagination", {}).get("next_page_token", "")
+            if not next_token:
+                break
+            time.sleep(0.5)
 
         except Exception as ex:
-            print(f"   ASIN {asin} page {page}: {ex}")
+            print(f"   Page {page+1} error: {ex}")
             break
 
     return reviews
 
 
-def scrape_amazon():
-    print(f"\n🛒 Scraping Amazon reviews for: {BRAND_NAME}...")
-    asins = AMAZON_ASINS if AMAZON_ASINS else search_amazon_asins()
+def scrape_google_shopping_reviews(keyword):
+    """Scrape Google Shopping product reviews for a brand keyword."""
+    reviews = []
 
-    if not asins:
-        print("   No ASINs found - skipping Amazon.")
+    # First find products
+    params = urllib.parse.urlencode({
+        "engine":  "google_shopping",
+        "q":       keyword,
+        "api_key": SERPAPI_KEY,
+        "num":     "10",
+    })
+    url = f"https://serpapi.com/search?{urllib.parse.urlencode({'engine':'google_shopping','q':keyword,'api_key':SERPAPI_KEY})}"
+
+    try:
+        data     = json.loads(fetch_url(url))
+        products = data.get("shopping_results", [])[:5]
+        print(f"   Found {len(products)} products on Google Shopping")
+
+        for product in products:
+            product_id    = product.get("product_id", "")
+            product_title = product.get("title", keyword)
+
+            if not product_id:
+                continue
+
+            # Get reviews for this product
+            rev_params = urllib.parse.urlencode({
+                "engine":     "google_product",
+                "product_id": product_id,
+                "api_key":    SERPAPI_KEY,
+            })
+            rev_url = f"https://serpapi.com/search?{rev_params}"
+
+            try:
+                rev_data    = json.loads(fetch_url(rev_url))
+                raw_reviews = rev_data.get("reviews", [])
+
+                for r in raw_reviews:
+                    text = r.get("content", "").strip()
+                    if not text:
+                        continue
+                    reviews.append({
+                        "review_id":  r.get("id", f"{product_id}_{len(reviews)}"),
+                        "stars":      str(r.get("rating", "")),
+                        "date":       r.get("date", ""),
+                        "title":      r.get("title", ""),
+                        "text":       text.replace("\n", " "),
+                        "source":     "google_shopping",
+                        "product":    product_title,
+                        "version":    "",
+                        "vote_count": "0",
+                    })
+
+                print(f"   {product_title[:40]}: {len(raw_reviews)} reviews")
+                time.sleep(0.3)
+
+            except Exception as ex:
+                print(f"   Product reviews error: {ex}")
+
+    except Exception as ex:
+        print(f"   Google Shopping search failed: {ex}")
+
+    return reviews
+
+
+def scrape_serpapi():
+    """Main SerpAPI scraper - tries Google Maps then Google Shopping."""
+    if not SERPAPI_KEY:
+        print("   ❌ SERPAPI_KEY not set. Add it to GitHub Secrets and Streamlit Secrets.")
         return []
 
+    print(f"\n🔍 Scraping Google Reviews via SerpAPI for: {BRAND_NAME}...")
     all_reviews = []
-    for asin in asins[:MAX_AMAZON_ASINS]:
-        reviews = scrape_amazon_product(asin)
-        all_reviews.extend(reviews)
-        time.sleep(1)
 
-    print(f"   ✅ Amazon: {len(all_reviews)} reviews from {len(asins)} products")
-    return all_reviews
+    # Try each keyword
+    seen_place_ids = set()
+    for keyword in KEYWORDS[:3]:
+        print(f"\n   Searching: '{keyword}'")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SOURCE 3 - Reddit Posts
-# ══════════════════════════════════════════════════════════════════════════════
-
-def scrape_reddit():
-    print(f"\n💬 Scraping Reddit mentions of: {BRAND_NAME}...")
-    all_posts = []
-    query     = urllib.parse.quote_plus(BRAND_NAME)
-
-    for sub in REDDIT_SUBREDDITS:
-        url = f"https://www.reddit.com/r/{sub}/search.json?q={query}&restrict_sr=1&limit=50&sort=new"
-        try:
-            data  = json.loads(fetch_url(url, extra_headers={"Accept": "application/json"}))
-            posts = data.get("data", {}).get("children", [])
-
-            for p in posts:
-                d = p.get("data", {})
-                text = d.get("selftext", "").strip()
-                title = d.get("title", "").strip()
-                combined = f"{title}. {text}".strip()
-                if len(combined) < 20:
-                    continue
-                # Only include if brand is actually mentioned
-                if BRAND_NAME.lower() not in combined.lower():
-                    continue
-
-                all_posts.append({
-                    "review_id":  d.get("id",""),
-                    "stars":      "",    # Reddit has no star rating - AI infers sentiment
-                    "date":       "",
-                    "title":      title[:200],
-                    "text":       combined[:1000],
-                    "source":     f"reddit_r/{sub}",
-                    "product":    BRAND_NAME,
-                    "version":    "",
-                    "vote_count": str(d.get("score", 0)),
-                })
-
-                if len(all_posts) >= MAX_REDDIT_POSTS:
-                    break
-
-            print(f"   r/{sub}: {len(posts)} posts found, {sum(1 for p in all_posts if f'r/{sub}' in p['source'])} matched")
+        # Google Maps reviews (for physical stores)
+        data_id, place_name, _ = search_google_place(keyword)
+        if data_id and data_id not in seen_place_ids:
+            seen_place_ids.add(data_id)
+            reviews = scrape_google_reviews(data_id, place_name, max_pages=3)
+            all_reviews.extend(reviews)
             time.sleep(0.5)
 
-        except Exception as ex:
-            print(f"   r/{sub}: {ex}")
+        # Google Shopping reviews (for products)
+        shopping_reviews = scrape_google_shopping_reviews(keyword)
+        all_reviews.extend(shopping_reviews)
+        time.sleep(0.5)
 
-    print(f"   ✅ Reddit: {len(all_posts)} posts mentioning {BRAND_NAME}")
-    return all_posts
+        # Stop if we have enough
+        if len(all_reviews) >= 300:
+            break
+
+    print(f"\n   ✅ SerpAPI: {len(all_reviews)} total reviews collected")
+    return all_reviews
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -262,30 +287,28 @@ def main():
     all_reviews = []
 
     if APP_STORE_ID.strip():
-        # ── Mode 1: App Store ─────────────────────────────────────────────────
         print("\n🔍 App Store ID found → using App Store mode")
         all_reviews = scrape_app_store()
     else:
-        # ── Mode 2: Amazon + Reddit ───────────────────────────────────────────
-        print("\n🔍 No App Store ID → switching to Amazon + Reddit mode")
-        amazon_reviews = scrape_amazon()
-        reddit_posts   = scrape_reddit()
-        all_reviews    = amazon_reviews + reddit_posts
+        print("\n🔍 No App Store ID → using SerpAPI (Google Reviews) mode")
+        all_reviews = scrape_serpapi()
 
     if not all_reviews:
-        print("\n⚠️  No reviews collected. Check config.py settings.")
+        print("\n⚠️  No reviews collected.")
+        print("   Check: SERPAPI_KEY is set in GitHub Secrets")
+        print("   Check: KEYWORDS in config.py match real business names")
         sys.exit(1)
 
     save_reviews(all_reviews)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # Summary
     sources = {}
     for r in all_reviews:
-        src = r.get("source","unknown").split("_")[0]
+        src = r.get("source", "unknown")
         sources[src] = sources.get(src, 0) + 1
 
     print("\n" + "=" * 55)
-    print(f"  ✅ Done - {len(all_reviews)} total reviews collected")
+    print(f"  ✅ Done - {len(all_reviews)} total reviews")
     for src, count in sources.items():
         print(f"     {src}: {count}")
     print("  Run: streamlit run main_app.py")
