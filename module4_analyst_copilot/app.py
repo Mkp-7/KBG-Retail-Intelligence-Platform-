@@ -1,4 +1,4 @@
-"""Module 4 — Analyst Copilot"""
+"""Module 4 - Analyst Copilot"""
 
 import os, sys
 import pandas as pd
@@ -41,7 +41,7 @@ def build_context():
     high_reviews = df[df["stars"]>=4]["text"].dropna().sample(min(5,len(df[df["stars"]>=4])),random_state=42).tolist()
     high_sample  = "\n".join([f"- {r[:150]}" for r in high_reviews])
 
-    context = f"""APP STORE REVIEW DATA — {APP_NAME}
+    context = f"""APP STORE REVIEW DATA - {APP_NAME}
 ====================================
 Total reviews: {total:,}
 Date range: {d_min} to {d_max}
